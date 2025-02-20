@@ -1,8 +1,8 @@
-use bellpepper_core::{
-    boolean::AllocatedBit, num::AllocatedNum, ConstraintSystem, LinearCombination, SynthesisError,
-};
 use ff::{PrimeField, PrimeFieldBits};
-use nova::traits::circuit::StepCircuit;
+use nova::frontend::{
+    num::AllocatedNum, AllocatedBit, ConstraintSystem, LinearCombination, SynthesisError,
+};
+use nova::nebula::rs::StepCircuit;
 
 #[derive(Clone, Debug, Default)]
 pub struct ProximityCircuit<F: PrimeField + PrimeFieldBits> {
@@ -23,11 +23,6 @@ where
     fn arity(&self) -> usize {
         1
     }
-
-    fn get_counter_type(&self) -> nova::StepCounterType {
-        nova::StepCounterType::Incremental
-    }
-
     fn synthesize<CS: ConstraintSystem<F>>(
         &self,
         cs: &mut CS,
@@ -138,6 +133,9 @@ where
 
         Ok(vec![output])
     }
+    fn non_deterministic_advice(&self) -> Vec<F> {
+        vec![]
+    }
 }
 
 fn num_to_bits_le_bounded<F: PrimeField + PrimeFieldBits, CS: ConstraintSystem<F>>(
@@ -234,106 +232,131 @@ fn less_than<F: PrimeField + PrimeFieldBits, CS: ConstraintSystem<F>>(
 mod tests {
     use crate::circuit::ProximityCircuit;
     use ff::Field;
-    use nova::{provider, spartan};
+    use halo2curves::bn256::{Bn256, Fr};
     use nova::{
-        provider::PallasEngine,
-        traits::{
-            circuit::TrivialCircuit, snark::RelaxedR1CSSNARKTrait, CurveCycleEquipped, Group,
-        },
+        nebula::rs::{PublicParams, RecursiveSNARK},
+        onchain::{decider::{prepare_calldata, Decider}, eth::evm::{compile_solidity, Evm}, utils::{get_formatted_calldata, get_function_selector_for_nova_cyclefold_verifier}, verifiers::{groth16::SolidityGroth16VerifierKey, kzg::SolidityKZGVerifierKey, nebula::{get_decider_template_for_cyclefold_decider, NovaCycleFoldVerifierKey}}},
+        provider::{Bn256EngineKZG, GrumpkinEngine},
+        traits::{snark::RelaxedR1CSSNARKTrait, Engine},
     };
-    use nova::{CompressedSNARK, PublicParams, RecursiveSNARK};
+    use rand::thread_rng;
+
+    use std::time::Instant;
+
     #[test]
     fn test_all() {
-        let generate_keys_to_json = true;
+        type E1 = Bn256EngineKZG;
+        type E2 = GrumpkinEngine;
+        type EE1 = nova::provider::hyperkzg::EvaluationEngine<Bn256, E1>;
+        type EE2 = nova::provider::ipa_pc::EvaluationEngine<E2>;
+        type S1 = nova::spartan::snark::RelaxedR1CSSNARK<E1, EE1>; // non-preprocessing SNARK
+        type S2 = nova::spartan::snark::RelaxedR1CSSNARK<E2, EE2>; // non-preprocessing SNARK
 
-        type G1 = pasta_curves::pallas::Point;
-        type G2 = pasta_curves::vesta::Point;
-
-        type EE1<G1> = provider::ipa_pc::EvaluationEngine<G1>;
-        type EE2<G2> = provider::ipa_pc::EvaluationEngine<G2>;
-
-        type S1Prime<G1> = spartan::ppsnark::RelaxedR1CSSNARK<G1, EE1<G1>>;
-        type S2Prime<G2> = spartan::ppsnark::RelaxedR1CSSNARK<G2, EE2<G2>>;
-
-        let circuit_primary = TrivialCircuit::default();
-        let circuit_secondary = ProximityCircuit {
-            x: <G2 as Group>::Scalar::from(5001u64),
-            y: <G2 as Group>::Scalar::from(5001u64),
+        let mut rng = thread_rng();
+        let circuit = ProximityCircuit {
+            x: <E1 as Engine>::Scalar::from(5001u64),
+            y: <E1 as Engine>::Scalar::from(5001u64),
         };
 
         // produce public parameters
-        let pp = PublicParams::<provider::PallasEngine>::setup(
-            &circuit_primary.clone(),
-            &circuit_secondary.clone(),
-            &*S1Prime::ck_floor(),
-            &*S2Prime::ck_floor(),
-        )
-        .unwrap();
+        let rs_pp = PublicParams::<E1>::setup(&circuit.clone(), &*S1::ck_floor(), &*S2::ck_floor());
 
-        let num_steps = 1;
-
+        let num_steps = 3;
+        let mut ic_i = <E1 as Engine>::Scalar::ZERO;
+        let z0 = vec![<E1 as Engine>::Scalar::ONE];
         // produce a recursive SNARK
-        let mut recursive_snark = RecursiveSNARK::<provider::PallasEngine>::new(
-            &pp,
-            &circuit_primary,
-            &circuit_secondary,
-            &[<G1 as Group>::Scalar::ONE],
-            &[<G2 as Group>::Scalar::ZERO],
-        )
-        .unwrap();
+        let mut rs = RecursiveSNARK::<E1>::new(&rs_pp, &circuit, &z0).unwrap();
 
-        for _i in 0..num_steps {
-            let res = recursive_snark.prove_step(&pp, &circuit_primary, &circuit_secondary);
-            assert!(res.is_ok());
+        for i in 0..num_steps {
+            let start = Instant::now();
+            rs.prove_step(&rs_pp, &circuit, ic_i).unwrap();
+
+            ic_i = rs.increment_commitment(&rs_pp, &circuit);
+            println!("RecursiveSNARK::prove {} : took {:?} ", i, start.elapsed());
         }
 
         // verify the recursive SNARK
-        let res = recursive_snark.verify(
-            &pp,
-            num_steps,
-            &[<G1 as Group>::Scalar::ONE],
-            &[<G2 as Group>::Scalar::ZERO],
-        );
+        let res = rs.verify(&rs_pp, num_steps, &z0, ic_i);
         assert!(res.is_ok());
+        println!("RecursiveSNARK::verify: {:?}", res.is_ok(),);
 
-        let (zn_primary, _) = res.unwrap();
+        let zn = res.unwrap();
 
         // sanity: check the claimed output with a direct computation of the same
-        assert_eq!(zn_primary, vec![<G1 as Group>::Scalar::ONE]);
-
+        assert_eq!(zn, vec![<E1 as Engine>::Scalar::ONE]);
+        let start = Instant::now();
         // produce the prover and verifier keys for compressed snark
-        let (pk, vk) = CompressedSNARK::<
-            provider::PallasEngine,
-            S1Prime<PallasEngine>,
-            S2Prime<<PallasEngine as CurveCycleEquipped>::Secondary>,
-        >::setup(&pp)
-        .unwrap();
+        let (decider_pk, decider_vk) = Decider::setup(&rs_pp, &mut rng, z0.len()).unwrap();
+        println!("Decider::setup: took {:?}", start.elapsed());
 
-        if generate_keys_to_json {
-            let serialized_vk = serde_json::to_string(&vk).unwrap();
-            std::fs::write(std::path::Path::new("vk.json"), serialized_vk)
-                .expect("Unable to write file");
-        }
+        let start = Instant::now();
         // produce a compressed SNARK
-        let res = CompressedSNARK::prove(&pp, &pk, &recursive_snark);
+        let res = Decider::prove(&rs_pp, &decider_pk, &rs, &mut rng);
         assert!(res.is_ok());
         let compressed_snark = res.unwrap();
+        println!("Decider::prove: took {:?}", start.elapsed());
 
-        if generate_keys_to_json {
-            let serialized_compressed_snark = serde_json::to_string(&compressed_snark).unwrap();
-            std::fs::write(
-                std::path::Path::new("compressed-snark.json"),
-                serialized_compressed_snark,
-            )
-            .expect("Unable to write file");
-        }
+        let start = Instant::now();
         // verify the compressed SNARK
-        let res = compressed_snark.verify(
-            &vk,
-            num_steps,
-            &[<G1 as Group>::Scalar::ONE],
-            &[<G2 as Group>::Scalar::ZERO],
+        let res = Decider::verify(
+            &compressed_snark,
+            decider_vk.clone(),
+            Fr::from(num_steps as u64),
+            z0,
+            zn,
+            (rs.r_U_primary.comm_W, rs.r_U_primary.comm_E),
+            rs.l_u_primary.comm_W,
         );
         assert!(res.is_ok());
+        println!("Decider::verify: took {:?}", start.elapsed());
+
+        // Now, let's generate the Solidity code that verifies this Decider final proof
+        let function_selector =
+            get_function_selector_for_nova_cyclefold_verifier(rs.z0.len() * 2 + 1);
+
+        let calldata: Vec<u8> = prepare_calldata(
+            function_selector,
+            Fr::from(rs.i as u64),
+            &rs.z0,
+            &rs.zi,
+            &rs.r_U_primary,
+            &rs.l_u_primary,
+            &compressed_snark,
+        )
+        .unwrap();
+
+        // prepare the setup params for the solidity verifier
+        let nova_cyclefold_vk = NovaCycleFoldVerifierKey::from((
+            decider_vk.pp_hash,
+            SolidityGroth16VerifierKey::from(decider_vk.groth16_vk),
+            SolidityKZGVerifierKey::from((decider_vk.kzg_vk, Vec::new())),
+            rs.z0.len(),
+        ));
+
+        // generate the solidity code
+        let decider_solidity_code = get_decider_template_for_cyclefold_decider(nova_cyclefold_vk);
+
+        // verify the proof against the solidity code in the EVM
+        let nova_cyclefold_verifier_bytecode =
+            compile_solidity(&decider_solidity_code, "NovaDecider");
+        let mut evm = Evm::default();
+
+        let verifier_address = evm.create(nova_cyclefold_verifier_bytecode);
+        println!("verifier_address: {:?}", verifier_address);
+        let (gas, output) = evm.call(verifier_address, calldata.clone());
+        println!("Solidity::verify: {:?}, gas: {:?}", output, gas);
+        assert_eq!(*output.last().unwrap(), 1);
+
+        // save smart contract and the calldata
+        println!("storing nova-verifier.sol and the calldata into files");
+        use std::fs;
+        fs::write(
+            "./nova-verifier.sol",
+            decider_solidity_code.clone(),
+        )
+        .expect("Unable to write to file");
+        fs::write("./solidity-calldata.calldata", calldata.clone()).expect("");
+        let s = get_formatted_calldata(calldata.clone());
+        fs::write("./solidity-calldata.inputs", s.join(",\n")).expect("");
     }
 }
