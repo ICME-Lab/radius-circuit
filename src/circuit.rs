@@ -300,12 +300,7 @@ mod tests {
         // verify the compressed SNARK
         let res = Decider::verify(
             &compressed_snark,
-            decider_vk.clone(),
-            Fr::from(num_steps as u64),
-            z0,
-            zn,
-            (rs.r_U_primary.comm_W, rs.r_U_primary.comm_E),
-            rs.l_u_primary.comm_W,
+            decider_vk.clone()
         );
         assert!(res.is_ok());
         println!("Decider::verify: took {:?}", start.elapsed());
@@ -316,11 +311,6 @@ mod tests {
 
         let calldata: Vec<u8> = prepare_calldata(
             function_selector,
-            Fr::from(rs.i as u64),
-            &rs.z0,
-            &rs.zi,
-            &rs.r_U_primary,
-            &rs.l_u_primary,
             &compressed_snark,
         )
         .unwrap();
