@@ -4,9 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bellpepper-core = "0.4.0"
-bellperson = { version = "0.25", default-features = false }
 ff = "0.13.0"
-nova = { git = "https://github.com/wyattbenno777/arecibo", branch = "feat/nebula", package = "arecibo" }
-pasta_curves = { version = "0.5", features = ["repr-c", "serde"] }
+nova = { git = "https://github.com/wyattbenno777/arecibo", branch = "feat/onchain-verifier", package = "arecibo" }
 serde_json = "1.0.133"
+halo2curves = { git = "https://github.com/ICME-Lab/halo2curves", branch = "main", features = ["bits", "derive_serde"] }
+rand = "0.8.5"
